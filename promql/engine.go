@@ -54,6 +54,7 @@ const (
 	maxInt64 = 9223372036854774784
 	// The smallest SampleValue that can be converted to an int64 without underflow.
 	minInt64 = -9223372036854775808
+	maxCacheSize		 = 10000
 )
 
 type engineMetrics struct {
@@ -250,6 +251,7 @@ type Engine struct {
 	noStepSubqueryIntervalFn func(rangeMillis int64) int64
 	enableAtModifier         bool
 	enableNegativeOffset     bool
+	cacheModule			*CacheModule
 }
 
 // NewEngine returns a new engine.
@@ -321,6 +323,11 @@ func NewEngine(opts EngineOpts) *Engine {
 			queryResultSummary,
 		)
 	}
+	
+	cm := &CacheModule{}
+	heap.Init(&cm.pq)
+	cm.itemMap = make(map[string]*Item)
+	cm.hitCountMap = make(map[string]int)
 
 	return &Engine{
 		timeout:                  opts.Timeout,
@@ -332,6 +339,7 @@ func NewEngine(opts EngineOpts) *Engine {
 		noStepSubqueryIntervalFn: opts.NoStepSubqueryIntervalFn,
 		enableAtModifier:         opts.EnableAtModifier,
 		enableNegativeOffset:     opts.EnableNegativeOffset,
+		cacheModule:			 cm,
 	}
 }
 
@@ -364,6 +372,7 @@ func (ng *Engine) NewInstantQuery(q storage.Queryable, qs string, ts time.Time) 
 	if err != nil {
 		return nil, err
 	}
+	
 	qry, err := ng.newQuery(q, expr, ts, ts, 0)
 	if err != nil {
 		return nil, err
@@ -549,7 +558,7 @@ func (ng *Engine) exec(ctx context.Context, q *query) (v parser.Value, ws storag
 	if err := contextDone(ctx, env); err != nil {
 		return nil, nil, err
 	}
-
+	
 	switch s := q.Statement().(type) {
 	case *parser.EvalStmt:
 		return ng.execEvalStmt(ctx, q, s)
@@ -566,6 +575,86 @@ func timeMilliseconds(t time.Time) int64 {
 
 func durationMilliseconds(d time.Duration) int64 {
 	return int64(d / (time.Millisecond / time.Nanosecond))
+}
+
+/* KAKAO */
+var numItem int = 0
+
+type Item struct {
+	value string // Input: query+time
+	priority int // Hit count
+	index int
+	recentQueriedTime int64 // RecentQueriedTime
+	returnValue parser.Value
+	warnings storage.Warnings
+	err error
+}
+
+type PriorityQueue []*Item
+
+type CacheModule struct {
+	pq PriorityQueue
+	itemMap map[string]*Item // Input: query+time, Output: *Item
+	hitCountMap map[string]int // Input: query+time, Output: Hit count
+}
+
+func (pq PriorityQueue) Len() int {
+	return len(pq)
+}
+
+func (pq PriorityQueue) Less(i, j int) bool {
+	if pq[i].recentQueriedTime < pq[j].recentQueriedTime {
+		return true
+	} else if pq[i].recentQueriedTime == pq[j].recentQueriedTime && pq[i].priority < pq[j].priority {
+		return true
+	}
+	return false
+}
+
+func (pq PriorityQueue) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
+	pq[i].index = i
+	pq[j].index = j
+}
+
+func (pq *PriorityQueue) Push(x interface{}) {
+	n := len(*pq)
+	item := x.(*Item)
+	item.index = n
+	*pq = append(*pq, item)
+}
+
+func (pq *PriorityQueue) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	item.index = -1
+	*pq = old[0:n-1]
+	return item
+}
+
+func (pq *PriorityQueue) update(item *Item, value string, rTime int64, priority int) {
+	item.value = value
+	item.priority = priority
+	item.recentQueriedTime = rTime
+	heap.Fix(pq, item.index)
+}
+
+func (ng *Engine) InsertCache(key string, query *query, val parser.Value, warnings storage.Warnings, err error) {
+	if(ng.cacheModule.pq.Len() == maxCacheSize) {
+		evict := heap.Pop(&ng.cacheModule.pq).(*Item)
+		
+		delete(ng.cacheModule.itemMap, evict.value)
+		delete(ng.cacheModule.hitCountMap, evict.value)
+	}
+
+	item := &Item{key, 1, numItem, time.Now().Unix(), val, warnings, err}
+	heap.Push(&ng.cacheModule.pq, item)
+
+	ng.cacheModule.itemMap[key] = item
+	ng.cacheModule.hitCountMap[key]++
+	ng.cacheModule.pq.update(item, item.value, item.recentQueriedTime, item.priority)
+	numItem++
 }
 
 // execEvalStmt evaluates the expression of an evaluation statement for the given time range.
@@ -586,6 +675,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 	// w.r.t. the start time since only 1 evaluation will be done on them.
 	setOffsetForAtModifier(timeMilliseconds(s.Start), s.Expr)
 	evalSpanTimer, ctxInnerEval := query.stats.GetSpanTimer(ctx, stats.InnerEvalTime, ng.metrics.queryInnerEval)
+
 	// Instant evaluation. This is executed as a range evaluation with one step.
 	if s.Start == s.End && s.Interval == 0 {
 		start := timeMilliseconds(s.Start)
@@ -600,10 +690,28 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 			noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
 		}
 
-		val, warnings, err := evaluator.Eval(s.Expr)
+		/* KAKAO */
+		var val parser.Value
+		var warnings storage.Warnings
+		var err error
+
+		key := (query.q + s.Start.String())
+		
+		if ng.cacheModule.hitCountMap[key] != 0 {
+			ng.cacheModule.hitCountMap[key]++
+			ng.cacheModule.itemMap[key].priority = ng.cacheModule.hitCountMap[key]
+			ng.cacheModule.itemMap[key].recentQueriedTime = time.Now().Unix()
+			val := ng.cacheModule.itemMap[key].returnValue
+			
+			ng.cacheModule.pq.update(ng.cacheModule.itemMap[key], key, ng.cacheModule.itemMap[key].recentQueriedTime, ng.cacheModule.itemMap[key].priority)
+			return val, ng.cacheModule.itemMap[key].warnings, ng.cacheModule.itemMap[key].err
+		}
+
+		val, warnings, err = evaluator.Eval(s.Expr)
 		if err != nil {
 			return nil, warnings, err
 		}
+		ng.InsertCache(key, query, val, warnings, err)
 
 		evalSpanTimer.Finish()
 
@@ -613,6 +721,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 		case Matrix:
 			mat = result
 		case String:
+			ng.cacheModule.itemMap[key].returnValue = result
 			return result, warnings, nil
 		default:
 			panic(errors.Errorf("promql.Engine.exec: invalid expression type %q", val.Type()))

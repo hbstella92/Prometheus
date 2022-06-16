@@ -554,7 +554,7 @@ func main() {
 		queryEngine *promql.Engine
 		ruleManager *rules.Manager
 	)
-
+	
 	if !agentMode {
 		opts := promql.EngineOpts{
 			Logger:                   log.With(logger, "component", "query engine"),

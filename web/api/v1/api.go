@@ -361,7 +361,10 @@ func (api *API) options(r *http.Request) apiFuncResult {
 }
 
 func (api *API) query(r *http.Request) (result apiFuncResult) {
+	startTime := time.Now()
+
 	ts, err := parseTimeParam(r, "time", api.now())
+	
 	if err != nil {
 		return invalidParamError(err, "time")
 	}
@@ -403,6 +406,9 @@ func (api *API) query(r *http.Request) (result apiFuncResult) {
 	if r.FormValue("stats") != "" {
 		qs = stats.NewQueryStats(qry.Stats())
 	}
+
+	elapsedTime := time.Since(startTime)
+	fmt.Println("ELAPSED TIME: ", elapsedTime)
 
 	return apiFuncResult{&queryData{
 		ResultType: res.Value.Type(),
